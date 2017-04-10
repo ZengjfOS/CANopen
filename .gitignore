@@ -1,0 +1,16 @@
+/canopend/app/canopend
+/canopencomm/canopencomm
+/canopencgi/canopen.cgi
+*.o
+*.bak
+
+/doc/
+
+tags
+
+# eclipse
+.metadata/
+.settings/
+Debug/
+Release/
+

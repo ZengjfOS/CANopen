@@ -1,0 +1,461 @@
+/****************************************************************************************
+ *                      CANopenSocket CANopenCGI.c hacking
+ * 说明：
+ *     分析一下CANopenSocket中的CANopenCGI部分是怎么工作的。
+ *
+ *                                          2017-3-23 深圳 南山平山村 曾剑锋
+ ***************************************************************************************/
+
+/*
+ * Client socket command interface (Apache CGI) for CANopenSocket.
+ *
+ * @file        CANopenCGI.c
+ * @author      Janez Paternoster
+ * @copyright   2016 Janez Paternoster
+ *
+ * This file is part of CANopenNode, an opensource CANopen Stack.
+ * Project home page is <https://github.com/CANopenNode/CANopenNode>.
+ * For more information on CANopen see <http://www.can-cia.org/>.
+ *
+ * CANopenNode is free and open source software: you can redistribute
+ * it and/or modify it under the terms of the GNU General Public License
+ * as published by the Free Software Foundation, either version 2 of the
+ * License, or (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program. If not, see <http://www.gnu.org/licenses/>.
+ */
+
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <errno.h>
+#include <ctype.h>
+#include <string.h>
+#include <strings.h>
+#include <fnmatch.h>
+#include <sys/un.h>
+#include <sys/socket.h>
+
+
+#ifndef BUF_SIZE
+#define BUF_SIZE            100000
+#endif
+
+
+/* Helper functions */
+static void errExitErrno(char* msg) {
+    printf("%s: %s\n", msg, strerror(errno));
+    exit(EXIT_FAILURE);
+}
+
+static void errExit(char* msg) {
+    printf("%s\n", msg);
+    exit(EXIT_FAILURE);
+}
+
+/**
+ * 字符串拷贝并转换成大写
+ */
+static void strcpyToUpper(char *dest, const char *src) {
+    char in;
+
+    do {
+        in = *(src++);
+        *(dest++) = toupper(in);
+    } while(in != 0);
+}
+
+/**
+ * 字符串转换成大写
+ */
+static void strToUpper(char *str) {
+    char c;
+
+    do {
+        c = *(str);
+        *(str++) = toupper(c);
+    } while(c != 0);
+}
+
+/**
+ * 字符串转换成小写
+ */
+static void strToLower(char *str) {
+    char c;
+
+    do {
+        c = *(str);
+        *(str++) = tolower(c);
+    } while(c != 0);
+}
+
+/* Decode hex string 'str' of length 'len' and return numerical value.
+ * In case of error in string, set 'err' to 1. */
+/**
+ * 将十六进制的字符串转成数字
+ */
+static unsigned int hex2dec(const char *str, int len, int *err){
+    unsigned int val = 0;
+    int i;
+
+    for(i=0; i<len; i++) {
+        char c = str[i];
+        if(c >= '0' && c <= '9') {
+            c = c - '0';
+        } else if (c >= 'A' && c <= 'F') {
+            c = c - ('A' - 10);
+        }
+        else {
+            *err = 1;
+            return 0;
+        }
+        val = val << 4 | c;
+    }
+    return val;
+}
+
+static void sendCommand(int fd, int sequence, char* command);
+
+static void printUsage(void) {
+printf(
+"Usage: canopen.cgi?wnniiiissdd=xxxx[&rnniiiissdd=]\n"
+"  - w    - One digit - 'W'rite or 'R'ead.\n"
+"  - nn   - Two hex digits of node ID.\n"
+"  - iiii - Four hex digits of Object Dictionary Index.\n"
+"  - ss   - Two hex digits of Object Dictionary Subindex.\n"
+"  - dd   - One to three digits of data type.\n"
+"  - xxxx - Value to be written.\n"
+"\n"
+"Datatypes:\n"
+"  - b                 - Boolean.\n"
+"  - u8, u16, u32, u64 - Unsigned integers.\n"
+"  - i8, i16, i32, i64 - Signed integers.\n"
+"  - r32, r64          - Real numbers.\n"
+"  - t, td             - Time of day, time difference.\n"
+"  - vs                - Visible string (between double quotes).\n"
+"  - os, us, d         - Octet string, unicode string, domain."
+);
+}
+
+
+/******************************************************************************/
+int main (int argc, char *argv[], char *env[]) {
+    char socketPath[260] = {0};  /* Name of the local domain socket. */
+
+    FILE *fp;
+    int fdSocket;
+    struct sockaddr_un addr;
+    char *queryString;
+    int queryStringAllocated = 0;
+
+    /* whitelist and blacklist are arrays of null separated strings, which
+     * contains patterns for comparision with commands from query string. */
+    char *whitelist;
+    char *blacklist;
+    int whitelistLen;
+    int blacklistLen;
+
+
+    /* Print mime */
+    /**
+     * 输出http协议的头
+     */
+    printf("Content-type:text/plain\n\n");
+
+
+    /* Get program options from configuration file */
+    /**
+     * 处理配置文件
+     */
+    fp = fopen("canopen.conf", "r");
+    if(fp == NULL) {
+        errExitErrno("Can't open configuration file");
+    }
+    else {
+        const char spaceDelim[] = " \t\n\r\f\v";
+        char buf[1000];
+        int wlSize = 1000;   /* byte length */
+        int blSize = 1000;
+        int wlDataSize = 0;
+        int blDataSize = 0;
+
+        whitelist = (char *) malloc(wlSize);
+        blacklist = (char *) malloc(blSize);;
+        // 最开始wlDataSize长度都是0，随着allow检测到的配置越来越多，长度会越来越长
+        whitelistLen = 0;   /* number of tokens in list */
+        blacklistLen = 0;
+        if(whitelist == NULL || blacklist == NULL) {
+            errExitErrno("Whitelist or Blacklist can't be allocated.");
+        }
+
+        // 每次读取一行
+        while(fgets(buf, sizeof(buf), fp) != NULL) {
+            char *token;
+            token = strtok(buf, spaceDelim);
+
+            if(token == NULL) {
+
+            }
+            /**
+             * 获取socketPath配置
+             */
+            else if(strcasecmp(token, "socketPath") == 0) {
+                if(strlen(socketPath) != 0) {
+                    errExit("Duplicate 'socketPath' in canopen.conf.");
+                }
+                strncpy(socketPath, strtok(NULL, spaceDelim), sizeof(socketPath));
+                socketPath[sizeof(socketPath)-1] = 0;
+            }
+            else if(strcasecmp(token, "allow") == 0) {
+                // 保存上一次的wlDataSize长度，随着allow检测到的配置越来越多，长度会越来越长
+                int prevDataSize = wlDataSize;
+
+                // 获取value
+                token = strtok(NULL, spaceDelim);
+                // 计算value长度并+1，最后一个字节用于存放字符串结束符，这个长度叠加到wlDataSize中
+                wlDataSize += (strlen(token) + 1);
+                // 长度大于预设字符串长度，双倍扩容并重新分配，不过从这里开看最大也就是双倍的扩容长度
+                while(wlDataSize > wlSize) {
+                    wlSize *= 2;
+                    whitelist = (char *) realloc(whitelist, wlSize);
+                    if(whitelist == NULL) {
+                        errExitErrno("Whitelist can't be allocated.");
+                    }
+                }
+                // 拷贝当前的匹配数据到whitelist中
+                strcpyToUpper(&whitelist[prevDataSize], token);
+                whitelistLen ++;
+            }
+            /**
+             * 类是于白名单
+             */
+            else if(strcasecmp(token, "deny") == 0) {
+                int prevDataSize = blDataSize;
+
+                token = strtok(NULL, spaceDelim);
+                blDataSize += (strlen(token) + 1);
+                while(blDataSize > blSize) {
+                    blSize *= 2;
+                    blacklist = (char *) realloc(blacklist, blSize);
+                    if(blacklist == NULL) {
+                        errExitErrno("Blacklist can't be allocated.");
+                    }
+                }
+                strcpyToUpper(&blacklist[prevDataSize], token);
+                blacklistLen ++;
+            }
+        }
+    }
+
+    fclose(fp);
+
+
+    /* Create and connect client socket */
+    /**
+     * 创建本地socket
+     */
+    fdSocket = socket(AF_UNIX, SOCK_STREAM, 0);
+    if(fdSocket == -1) {
+        errExitErrno("Socket creation failed");
+    }
+
+    /**
+     * 配置本地socket
+     */
+    memset(&addr, 0, sizeof(struct sockaddr_un));
+    addr.sun_family = AF_UNIX;
+    strncpy(addr.sun_path, socketPath, sizeof(addr.sun_path) - 1);
+
+    /**
+     * 连接本地socket
+     */
+    if(connect(fdSocket, (struct sockaddr *)&addr, sizeof(struct sockaddr_un)) == -1) {
+        errExitErrno("Socket connection failed");
+    }
+
+
+    /* get query string */
+    /**
+     * 获取网络请求数据
+     */
+    queryString = getenv("QUERY_STRING"); /* HTTP GET method. */
+    if(queryString != NULL && strlen(queryString) == 0) {
+        queryString = malloc(BUF_SIZE);
+        if(queryString == NULL) {
+            errExitErrno("queryString can't be allocated.");
+        }
+        queryStringAllocated = 1;
+        fgets(queryString, BUF_SIZE, stdin); /* HTTP POST method. */
+    }
+    if(queryString == NULL && argc >= 2) {
+        queryString = argv[1];  /* If no query string, try first argument. */
+    }
+
+
+    /* get commands from query string */
+    /**
+     * 解析网络请求数据
+     */
+    if(queryString != NULL && strlen(queryString) > 0) {
+        char *command;
+        int sequence = 1;
+
+        /* put whole query string to upper case */
+        /**
+         * 将请求数据转为大写的格式
+         */
+        strToUpper(queryString);
+
+        command = strtok(queryString, "&");
+        while(command != NULL) {
+            int i;
+            int offset;
+            int passed = 0;
+
+            /* Test whitelist and blacklist */
+            /**
+             * 一个一个偏移着找
+             */
+            offset = 0;
+            for(i=0; i<whitelistLen; i++) {
+                char *patern = &whitelist[offset];
+                if(fnmatch(patern, command, 0) == 0) {
+                    passed = 1;
+                    break;
+                }
+                offset += strlen(patern) + 1;
+            }
+            /**
+             * 检查黑名单
+             */
+            if(passed == 1) {
+                offset = 0;
+                for(i=0; i<blacklistLen; i++) {
+                    char *patern = &blacklist[offset];
+                    if(fnmatch(patern, command, 0) == 0) {
+                        passed = -1; /* not allowed */
+                        break;
+                    }
+                    offset += strlen(patern) + 1;
+                }
+            }
+
+            /* Send command or error message */
+            if(strlen(command) < 9) {
+                printf("? %s [%d] ERROR: 101 - Syntax error in command.\n", command, sequence);
+            }
+            else if(passed == 1) {
+                sendCommand(fdSocket, sequence, command);
+            }
+            else {
+                printf("%c %c%c%c%c%c%c%c%c [%d] ERROR: 100 - Access restriction, command %s.\n",
+                    command[0], command[1], command[2], command[3], command[4],
+                    command[5], command[6], command[7], command[8],
+                    sequence, (passed==0)?"not on whitelist":" on blacklist");
+            }
+
+            command = strtok(NULL, "&");
+            sequence ++;
+        }
+    }
+    else {
+        printUsage();
+    }
+
+
+    close(fdSocket);
+    free(whitelist);                    // 释放白名单
+    free(blacklist);                    // 释放黑名单
+    if(queryStringAllocated == 1) {
+        free(queryString);
+    }
+
+    exit(EXIT_SUCCESS);
+}
+
+
+static void sendCommand(int fd, int sequence, char* command) {
+    int i, err;
+    char comm;
+    unsigned int nodeId, idx, sidx;
+    char dataType[4];
+    char *value = "";
+
+    char buf[BUF_SIZE];
+
+    /* Parse command. It is at least 8 characters long. */
+    /**
+     * 解析命令
+     */
+    err = 0;
+
+    comm = command[0];
+    if(comm != 'R' && comm != 'W') {
+        err = 1;
+    }
+
+    nodeId = hex2dec(&command[1], 2, &err);
+    if(nodeId < 1 || nodeId > 127) {
+        err = 1;
+    }
+
+    idx = hex2dec(&command[3], 4, &err);
+    sidx = hex2dec(&command[7], 2, &err);
+
+    for(i=0; i<sizeof(dataType); i++) {
+        char c = command[9+i];
+
+        if(c == '=' || c == 0) {
+            dataType[i] = 0;
+            if(c == '=') {
+                value = &command[10+i];
+            }
+            break;
+        }
+        dataType[i] = c;
+    }
+    if(i > 3) {
+        err = 1;
+        dataType[0] = 0;
+    }
+    if(strlen(value) > (sizeof(buf) - 50)) {
+        err = 1;
+    }
+
+    /* Write command according to CiA309-3. */
+    /**
+     * 命令转换，转换成canopend能接收的命令格式
+     */
+    if(err == 0) {
+        size_t wlen, rlen;
+
+        strToLower(dataType);
+
+        wlen = sprintf(buf, "[%d] 0x%02X %c 0x%04X 0x%02X %s %s\n",
+                sequence, nodeId, tolower(comm), idx, sidx, dataType, value);
+
+        if (write(fd, buf, wlen) != wlen) {
+            errExit("Socket write failed");
+        }
+
+        rlen = read(fd, buf, sizeof(buf));
+
+        if(rlen == -1) {
+            errExit("Socket read failed");
+        }
+
+        printf("%c %02X%04X%02X %s",
+            comm, nodeId, idx, sidx, buf);
+    }
+    else {
+        printf("? %s [%d] ERROR: 101 - Syntax error in command.\n",
+                    command, sequence);
+    }
+}
